@@ -1,5 +1,5 @@
-TARG=gofunge
-GOFILES=gofunge.go
+TARG=gofunge93
+GOFILES=gofunge93.go
 
 include $(GOROOT)/src/Make.$(GOARCH)
-include $(GOROOT)/src/Make.cmd
+include $(GOROOT)/src/Make.pkg
