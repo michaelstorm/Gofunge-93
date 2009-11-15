@@ -1,0 +1,112 @@
+Originally appeared at: http://worsepoetry.blogspot.com/2009/11/gofunge-93-concurrent-befunge-93-in-go.html
+
+This is my first post and I haven't gotten much sleep, so I'll get right to the point:
+
+As bad as the coding here is, the poetry will be worse.
+
+Did you get chills? I did. I would like to share them with you. Let's begin.
+
+Despite this being my finals week, I learned Go, "Google's" new general-purpose programming language. I say "Google's" in quotes because I don't know if Google claims ownership and not just editorial control. More likely, I think, Google did their thing of employing people who are awesome (Rob Pike and Ken Thompson) to keep on being awesome.
+
+Back to me. I saw Go's features and thought to myself, "How can I create something awesome with this awesome language?" Thus continuing the chain of awesome language creators -> awesome language -> me. It had to be doable in roughly a weekend, yet take enough thought that I didn't just translate some boilerplate C. Idioms had to be learned from this exercise. Finally, I settled on a Befunge-93 interpreter and called it Gofunge-93.
+
+Get the code:
+You can pull the code from either the Github project page page or directly:
+
+git clone git://github.com/limec0c0nut/Gofunge-93.git gofunge93
+
+Why Befunge-93, the two people who stumble upon this blog may ask? I answer, 1) it's two-dimensional, and 2) it's easier than Befunge 98. You almost have to admire the degree to which Befunge 98's designers went waaaaay overboard.
+
+Epiphany:
+So it's two in the morning, I'm almost done with Gofunge-93, and I realize that I haven't used channels yet. Now, I love computability theory, which I say to explain my epiphany. Having only a stack, Befunge-93 implicitly creates a "tree" of dependencies between calculations. Using this tree, we can transparently and concurrently execute some instructions. It's easy to do this in Go. Instead of a stack of integers, our interpreter is going to use a stack of integer channels. Each operator can pop input channels off the stack, push result channels onto the stack, or both.
+
+Take the + operator. It pops two input channels off the stack, pushes a result channel onto the stack and passes all three to a goroutine. Then the interpreter continues on its merry way to the next instruction, not having to worry about whether the + operator has completed. Meanwhile, the goroutine blocks until it receives values from both of its input channels, then adds them together and writes their sum to its result channel. If anyone took +'s result channel as their input channel, it may now be possible for them to unblock, and so on down the line. Here's what it looks like:
+
+switch inst {
+    ...
+    case '+':
+        in1 := b.stack.Pop();
+        in2 := b.stack.Pop();
+        c := make(chan int64, 1);
+        b.stack.Push(c);
+        
+        go func(in1, in2 <-chan int64, out chan<- int64) {
+            out <- (<-in2)+(<-in1);
+        }(in1, in2, c);
+    ...
+}
+
+Why it works:
+I'll use an example. Here's some Befunge-93 code:
+
+12+4*82-/.
+
+(You don't need to know Befunge-93 to understand this; read it from left to right like reverse Polish notation. The period means "pop the stack and output the value as an integer".)
+
+When run, this produces the stack progression (bottom->top):
+
+1 (push 1)
+1 2 (push 2)
+3 (add)
+3 4 (push 4)
+12 (multiply)
+12 8 (push 8)
+12 8 2 (push 2)
+12 6 (subtract)
+2 (divide)
+(print)
+
+What's the only part we care about? The answer; the value that's printed. So which bit do we make concurrent? Every instruction has to happen in order, right? Right, they will. But instead of the order in which they appear, let's execute in order of dependency.
+
+Let's rewrite this stack progression as:
+
+1
+1 2
+(result of 2+1)
+(result of 2+1) 4
+(result of (result of 2+1)*4)
+(result of (result of 2+1)*4) 8
+(result of (result of 2+1)*4) 8 2
+(result of (result of 2+1)*4) (result of 8-2)
+(result of (result of (result of 2+1)*4)/(result of 8-2))
+
+Internally, the interpreter doesn't care about the value of 2+1. It just waits until the operation has been evaluated, then multiplies the result by 4. Then anything else that depends on that result can be evaluated, too, like dominoes. This results in (2+1)*4 and (8-2) possibly executing concurrently, and possibly on different processor cores, and therefore simultaneously.
+
+I/O ends the madness:
+If you, as a human, were inside the interpreter and could watch this party happening, you might well care that some operations seem to happen out of order. But when you wrote this program, you specified with the final period operator that the only thing you cared about was the value at the top of the stack when everything before that period had finished. Well, technically not everything; just everything the period operator depends on. The period operator depends on (2+1)*4/(8-2), which in turn depends on (2+1)*4 and 8-2, the former of which depends on 2+1. The difference from the other operators is that the period operator will block the interpreter from proceeding to the next instruction until it and all operations that it depends on have been evaluated. Therefore all input and output to or from any Befunge-93 program will happen in the same order. Only the calculations will be concurrent. More than that, this concurrency is transparent.
+
+Under the covers:
+Gofunge-93 uses a struct called Stack in non-concurrent mode and ChanStack in concurrent mode, both of which wrap vector.Vector. In non-concurrent mode, Stack is a stack of int64's, as could be expected. In concurrent mode, Stack is a stack of <-chan int64's with buffers of size 1.
+
+In non-concurrent mode, operators pop values off the stack and use them directly. In concurrent mode, a non-I/O operator pops input channels off the stack, pushes an output channel to the stack, then spawns a goroutine to perform the real work and continues on to the next instruction. The goroutine blocks on all of its input channels until it has all the values needed to perform its operation, at which point it writes the result to its output channel and terminates. An I/O operator, on the other hand, pops input channels off the stack and blocks on them without spawning a goroutine. It will also block on actual sending/receiving from the environment.
+
+Now, theoretically the interpreter itself doesn't have to block on I/O. A separate goroutine can do all the blocking and synchronization with the instruction pointer running on ahead, but then we run into fun things like the halting problem.
+
+I'm looking at you, Clang:
+So why can't we do this for any program written in an arbitrary language, like C? We can, actually, although we have to execute our program in the right environment. Remember our time together a few paragraphs ago? When I said that if input and output happen in the same order, concurrently executed operations are indistinguishable from non-concurrent ones? That's what I meant, anyway. In Befunge-93, it's easy to handle that; the only I/O operators are:
+
+[0-9]
+[0x00-0xFF] in string mode
+.
+,
+&
+~
+g
+p
+
+No problem. In C, there are a few more:
+
+fgetc, fgets, fprintf, fputc, fputs, fread, fscanf, fwrite, getc, getchar, gets, printf, putc, putchar, puts, scanf, ungetc, vfprintf, vfscanf, vprintf, vscanf ...
+
+Blah, blah, you get the idea. There are a lot. All the compiler has to do is mark these special functions as blocking, and everything else can be executed concurrently, as above. (I'm making it sound as though implementing this in C would be easy. It's not. First of all, C is a compiled language. My dinky little interpreter is nothing by comparison. There are about a thousand other reasons, too. The guys who write C compilers are very, very smart.)
+
+Also, C programs aren't usually executed in nice little walled gardens like my interpreter. Some C programs do crazy things like share memory or handle signals, both of which would have to be marked as I/O. For shared memory, this can be as simple as marking every read/write to/from a dereferenced pointer as an I/O operation. For signal handling, well, someone smarter than me can figure that nugget out. There are probably other ways to mess with a running C program that I'm forgetting.
+
+Performance isn't everything:
+And thank God, because it's terrible. Try running life.bf from the programs folder. Concurrent mode runs several orders of magnitude slower than non-concurrent, but why? Simple: overhead. The runtime cost of creating channels for every computation and using them to communicate values far outweighs the time spent computing the values themselves. At least, with Befunge-93's limited instruction set. If we imagine that the + and - operators were defined as "wait 5 seconds and add" and "wait 5 seconds and subtract", the simple program above would take about 10 seconds in non-concurrent mode but 5 seconds in concurrent mode. Like so many things in computer science, it's all about tradeoffs.
+
+Tip your waitresses:
+At the time of this writing, Go's only been around for a few days. Maybe this will serve as a nice demonstration of its features for somebody. Spread the love; I have so much of it to give. It's also not my bandwidth.
+
+Thanks for reading,
+Mike Storm
